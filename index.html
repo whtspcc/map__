@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Маршрут прогулки</title>
+<script src="4223d0db-cc79-44d2-aaf1-7731bf37c6d5"></script>
+<style>
+  html, body { margin: 0; height: 100%; font-family: -apple-system, system-ui, sans-serif; }
+  #map { position: absolute; inset: 0; }
+  #panel {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 10;
+    background: #fff; padding: 12px 14px calc(12px + env(safe-area-inset-bottom));
+    border-radius: 16px 16px 0 0; box-shadow: 0 -2px 12px rgba(0,0,0,.2);
+  }
+  .row { display: flex; gap: 8px; margin-bottom: 8px; }
+  button {
+    flex: 1; padding: 12px; font-size: 16px; border: 0; border-radius: 10px;
+    background: #2b7de9; color: #fff;
+  }
+  button.secondary { background: #e8eaed; color: #222; }
+  button.active { background: #1a9c4b; }
+  input { width: 80px; padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 10px; }
+  label { align-self: center; flex: 1; font-size: 15px; }
+  #status { font-size: 14px; color: #444; min-height: 18px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <div class="row">
+    <button id="locate">Где я</button>
+    <button id="modePoint" class="secondary active">До точки</button>
+    <button id="modeLoop" class="secondary">Круг</button>
+  </div>
+  <div class="row" id="loopRow" style="display:none">
+    <label>Длина, км:</label>
+    <input id="km" type="number" min="1" max="20" step="0.5" value="3">
+    <button id="build">Построить</button>
+  </div>
+  <div id="status">Нажми «Где я», чтобы определить положение.</div>
+</div>
+
+<script>
+let map, me = null, meMark = null, route = null, mode = 'point';
+const $ = id => document.getElementById(id);
+const status = t => $('status').textContent = t;
+
+ymaps.ready(() => {
+  map = new ymaps.Map('map', { center: [59.93, 30.31], zoom: 12, controls: ['zoomControl'] });
+
+  // режим "до точки": тап по карте
+  map.events.add('click', e => {
+    if (mode !== 'point') return;
+    if (!me) { status('Сначала определи своё положение.'); return; }
+    buildRoute([me, e.get('coords')]);
+  });
+});
+
+function locate() {
+  if (!navigator.geolocation) { status('Геолокация не поддерживается.'); return; }
+  status('Определяю положение...');
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      me = [pos.coords.latitude, pos.coords.longitude];
+      if (meMark) map.geoObjects.remove(meMark);
+      meMark = new ymaps.Placemark(me, {}, { preset: 'islands#blueCircleDotIcon' });
+      map.geoObjects.add(meMark);
+      map.setCenter(me, 15);
+      status(mode === 'point' ? 'Тапни по карте, куда идти.' : 'Задай длину и нажми «Построить».');
+    },
+    err => status('Ошибка геолокации: ' + err.message),
+    { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+  );
+}
+
+function buildRoute(points) {
+  if (route) map.geoObjects.remove(route);
+  route = new ymaps.multiRouter.MultiRoute(
+    { referencePoints: points, params: { routingMode: 'pedestrian' } },
+    { boundsAutoApply: true, wayPointVisible: false }
+  );
+  map.geoObjects.add(route);
+  status('Строю маршрут...');
+  route.model.events.add('requestsuccess', () => {
+    const r = route.getActiveRoute();
+    if (r) status(`Длина: ${r.properties.get('distance').text}, время: ${r.properties.get('duration').text}`);
+  });
+  route.model.events.add('requestfail', () => status('Не удалось построить маршрут.'));
+}
+
+// круговой маршрут: точки на окружности, проходящей через текущее положение
+function buildLoop() {
+  if (!me) { status('Сначала определи своё положение.'); return; }
+  const km = parseFloat($('km').value) || 3;
+  // по улицам путь длиннее прямой окружности, поэтому берём запас
+  const r = (km / (2 * Math.PI)) * 0.75;
+  const startAngle = Math.random() * 2 * Math.PI;
+  const kLat = 111.32, kLon = 111.32 * Math.cos(me[0] * Math.PI / 180);
+  const center = [me[0] + (r / kLat) * Math.sin(startAngle), me[1] + (r / kLon) * Math.cos(startAngle)];
+  const pts = [me];
+  const N = 5;
+  for (let i = 1; i < N; i++) {
+    const a = startAngle + Math.PI + (2 * Math.PI * i) / N; // движемся по кругу от старта
+    pts.push([center[0] + (r / kLat) * Math.sin(a), center[1] + (r / kLon) * Math.cos(a)]);
+  }
+  pts.push(me);
+  buildRoute(pts);
+}
+
+function setMode(m) {
+  mode = m;
+  $('modePoint').classList.toggle('active', m === 'point');
+  $('modeLoop').classList.toggle('active', m === 'loop');
+  $('loopRow').style.display = m === 'loop' ? 'flex' : 'none';
+  status(m === 'point' ? 'Тапни по карте, куда идти.' : 'Задай длину и нажми «Построить».');
+}
+
+$('locate').onclick = locate;
+$('modePoint').onclick = () => setMode('point');
+$('modeLoop').onclick = () => setMode('loop');
+$('build').onclick = buildLoop;
+</script>
+</body>
+</html>
