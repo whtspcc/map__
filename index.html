@@ -82,11 +82,22 @@ function buildRoute(points) {
   );
   map.geoObjects.add(route);
   status('Строю маршрут...');
+
   route.model.events.add('requestsuccess', () => {
     const r = route.getActiveRoute();
-    if (r) status(`Длина: ${r.properties.get('distance').text}, время: ${r.properties.get('duration').text}`);
+    if (r) {
+      status(`Длина: ${r.properties.get('distance').text}, время: ${r.properties.get('duration').text}`);
+    } else {
+      status('Маршрут не найден.');
+    }
   });
-  route.model.events.add('requestfail', () => status('Не удалось построить маршрут.'));
+
+  route.model.events.add('requestfail', e => {
+    const err = e.get('error');
+    const msg = err && err.message ? err.message : 'неизвестная ошибка';
+    status('Не удалось построить маршрут: ' + msg);
+    console.log('route error:', err);
+  });
 }
 
 // круговой маршрут: точки на окружности, проходящей через текущее положение
