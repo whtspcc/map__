@@ -18,8 +18,9 @@
     flex: 1; padding: 12px; font-size: 16px; border: 0; border-radius: 10px;
     background: #2b7de9; color: #fff;
   }
+  button:disabled { opacity: .5; }
   button.secondary { background: #e8eaed; color: #222; }
-  button.active { background: #1a9c4b; }
+  button.active { background: #1a9c4b; color: #fff; }
   input { width: 80px; padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 10px; }
   label { align-self: center; flex: 1; font-size: 15px; }
   #status { font-size: 14px; color: #444; min-height: 18px; }
@@ -42,7 +43,39 @@
 </div>
 
 <script>
+let map, me = null, meMark = null, route = null, mode = 'point';
+const $ = id => document.getElementById(id);
+const status = t => $('status').textContent = t;
+
 const M_LAT = 110540, M_LON = 111320; // метров в градусе
+
+ymaps.ready(() => {
+  map = new ymaps.Map('map', { center: [59.93, 30.31], zoom: 12, controls: ['zoomControl'] });
+
+  // режим "до точки": тап по карте
+  map.events.add('click', e => {
+    if (mode !== 'point') return;
+    if (!me) { status('Сначала определи своё положение.'); return; }
+    buildRoute([me, e.get('coords')]);
+  });
+});
+
+function locate() {
+  if (!navigator.geolocation) { status('Геолокация не поддерживается.'); return; }
+  status('Определяю положение...');
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      me = [pos.coords.latitude, pos.coords.longitude];
+      if (meMark) map.geoObjects.remove(meMark);
+      meMark = new ymaps.Placemark(me, {}, { preset: 'islands#blueCircleDotIcon' });
+      map.geoObjects.add(meMark);
+      map.setCenter(me, 15);
+      status(mode === 'point' ? 'Тапни по карте, куда идти.' : 'Задай длину и нажми «Построить».');
+    },
+    err => status('Ошибка геолокации: ' + err.message),
+    { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+  );
+}
 
 // запрос пешеходного маршрута; возвращает {line, km, min}
 async function fetchRoute(points) {
@@ -166,6 +199,19 @@ async function buildLoop() {
     btn.disabled = false;
   }
 }
+
+function setMode(m) {
+  mode = m;
+  $('modePoint').classList.toggle('active', m === 'point');
+  $('modeLoop').classList.toggle('active', m === 'loop');
+  $('loopRow').style.display = m === 'loop' ? 'flex' : 'none';
+  status(m === 'point' ? 'Тапни по карте, куда идти.' : 'Задай длину и нажми «Построить».');
+}
+
+$('locate').onclick = locate;
+$('modePoint').onclick = () => setMode('point');
+$('modeLoop').onclick = () => setMode('loop');
+$('build').onclick = buildLoop;
 </script>
 </body>
 </html>
