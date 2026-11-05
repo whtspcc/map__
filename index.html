@@ -44,6 +44,7 @@
 
 <script>
 let map, me = null, meMark = null, route = null, mode = 'point';
+let buildSeq = 0; // номер актуального построения; старые результаты отбрасываются
 const $ = id => document.getElementById(id);
 const status = t => $('status').textContent = t;
 
@@ -116,12 +117,15 @@ function drawRoute(r) {
 
 // режим "до точки"
 async function buildRoute(points) {
+  const my = ++buildSeq;
   status('Строю маршрут...');
   try {
     const r = await fetchRoute(points);
+    if (my !== buildSeq) return;
     drawRoute(r);
     status(`Длина: ${r.km.toFixed(1)} км, время пешком: ~${Math.round(r.min)} мин`);
   } catch (err) {
+    if (my !== buildSeq) return;
     status('Не удалось построить маршрут: ' + err.message);
     console.log('route error:', err);
   }
@@ -245,19 +249,23 @@ async function buildLoop() {
   let scale = 0.75;            // радиус круга относительно "идеального"; подстраивается сам
   let best = null, tried = 0, fails = 0, lastErr = '';
   const base = Math.random() * 2 * Math.PI;
+  const my = ++buildSeq;
 
   try {
     for (let i = 0; i < MAX_TRIES; i++) {
-      status(`Ищу круг без повторов: вариант ${i + 1} из ${MAX_TRIES}...`);
+      status(`Ищу круг без повторов: вариант ${i + 1} из ${MAX_TRIES}` +
+        (best ? `, лучший пока: ${best.km.toFixed(1)} км, повторов ${Math.round(best.overlap * 100)}%` : '') + '...');
       const angle = base + i * 2.4;                 // направления не повторяются
       const r = (km / (2 * Math.PI)) * scale;
 
       let c = null;
       try {
         const raw = await fetchRoute(loopPoints(angle, r, i % 2 ? 1 : -1, 4 + (i % 3)));
+        if (my !== buildSeq) return;                // запустили другое построение
         c = processLoop(raw);
         fails = 0;
       } catch (e) {
+        if (my !== buildSeq) return;
         lastErr = e.message;
         if (++fails >= MAX_FAILS) break;            // роутер недоступен - не мучаем
         continue;
@@ -267,10 +275,7 @@ async function buildLoop() {
       tried++;
       c.lenErr = Math.abs(c.km - km) / km;
       c.score = c.lenErr + 3 * c.overlap;           // повторы штрафуются сильнее длины
-      if (!best || c.score < best.score) {
-        best = c;
-        drawRoute(best);                            // сразу показываем лучший на данный момент
-      }
+      if (!best || c.score < best.score) best = c;
 
       if (best.overlap <= OVERLAP_OK && best.lenErr <= LEN_OK) break; // хороший найден
 
@@ -278,15 +283,18 @@ async function buildLoop() {
       scale *= Math.pow(Math.min(2, Math.max(0.5, km / c.km)), 0.7);
       scale = Math.min(1.5, Math.max(0.3, scale));
       await new Promise(res => setTimeout(res, 200)); // не долбим публичный сервер
+      if (my !== buildSeq) return;
     }
 
     if (!best) throw new Error(lastErr || 'ни один вариант не построился');
+    drawRoute(best);                                // рисуем один раз, только итоговый
     const head = `Длина: ${best.km.toFixed(1)} км (цель ${km}), ~${Math.round(best.min)} мин`;
     status(best.overlap <= OVERLAP_OK
       ? head + ', без повторов'
       : head + `, повторов ${Math.round(best.overlap * 100)}% (без повторов не нашлось, взял лучший из ${tried})`);
     console.log('loop: вариантов', tried, 'тупиков вырезано', best.spurs, 'повторы', best.overlap);
   } catch (err) {
+    if (my !== buildSeq) return;
     status('Не удалось построить круг: ' + err.message);
     console.log('loop error:', err);
   } finally {
@@ -295,6 +303,7 @@ async function buildLoop() {
 }
 
 function setMode(m) {
+  buildSeq++;
   mode = m;
   $('modePoint').classList.toggle('active', m === 'point');
   $('modeLoop').classList.toggle('active', m === 'loop');
