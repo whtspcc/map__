@@ -74,30 +74,40 @@ function locate() {
   );
 }
 
-function buildRoute(points) {
+async function buildRoute(points) {
   if (route) map.geoObjects.remove(route);
-  route = new ymaps.multiRouter.MultiRoute(
-    { referencePoints: points, params: { routingMode: 'pedestrian' } },
-    { boundsAutoApply: true, wayPointVisible: false }
-  );
-  map.geoObjects.add(route);
+  route = null;
   status('Строю маршрут...');
 
-  route.model.events.add('requestsuccess', () => {
-    const r = route.getActiveRoute();
-    if (r) {
-      status(`Длина: ${r.properties.get('distance').text}, время: ${r.properties.get('duration').text}`);
-    } else {
-      status('Маршрут не найден.');
-    }
-  });
+  // у OSRM порядок координат lon,lat, у Яндекса lat,lon
+  const coords = points.map(p => p[1] + ',' + p[0]).join(';');
+  const url = 'https://routing.openstreetmap.de/routed-foot/route/v1/foot/' +
+              coords + '?overview=full&geometries=geojson';
 
-  route.model.events.add('requestfail', e => {
-    const err = e.get('error');
-    const msg = err && err.message ? err.message : 'неизвестная ошибка';
-    status('Не удалось построить маршрут: ' + msg);
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    if (data.code !== 'Ok' || !data.routes.length) throw new Error(data.code || 'нет маршрута');
+
+    const r = data.routes[0];
+    const line = r.geometry.coordinates.map(c => [c[1], c[0]]); // обратно в lat,lon
+
+    route = new ymaps.Polyline(line, {}, {
+      strokeColor: '#2b7de9',
+      strokeWidth: 5,
+      strokeOpacity: 0.85
+    });
+    map.geoObjects.add(route);
+    map.setBounds(route.geometry.getBounds(), { checkZoomRange: true, zoomMargin: 40 });
+
+    const km = (r.distance / 1000).toFixed(1);
+    const min = Math.round(r.duration / 60);
+    status(`Длина: ${km} км, время пешком: ~${min} мин`);
+  } catch (err) {
+    status('Не удалось построить маршрут: ' + err.message);
     console.log('route error:', err);
-  });
+  }
 }
 
 // круговой маршрут: точки на окружности, проходящей через текущее положение
