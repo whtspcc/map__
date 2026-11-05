@@ -77,7 +77,9 @@ function locate() {
   );
 }
 
-// запрос пешеходного маршрута; возвращает {line, km, min}
+// ---------- запрос маршрута ----------
+
+// пешеходный маршрут через список точек; возвращает {line, km, min}
 async function fetchRoute(points) {
   const coords = points.map(p => p[1] + ',' + p[0]).join(';');
   const url = 'https://routing.openstreetmap.de/routed-foot/route/v1/foot/' +
@@ -116,82 +118,167 @@ async function buildRoute(points) {
   }
 }
 
-// доля маршрута, где ты идёшь по тем же местам повторно (0..1)
-function overlapRatio(line) {
-  const step = 10, cell = 20, edge = 15, gap = 30;
-  const cosLat = Math.cos(line[0][0] * Math.PI / 180);
-  // 1) разбиваем линию на точки через каждые ~10 м
-  const pts = [line[0]];
-  for (let i = 1; i < line.length; i++) {
-    const [la1, lo1] = line[i - 1], [la2, lo2] = line[i];
-    const dist = Math.hypot((la2 - la1) * M_LAT, (lo2 - lo1) * M_LON * cosLat);
-    const n = Math.max(1, Math.round(dist / step));
-    for (let k = 1; k <= n; k++) {
-      pts.push([la1 + (la2 - la1) * k / n, lo1 + (lo2 - lo1) * k / n]);
-    }
-  }
-  // 2) считаем точки, попавшие в клетку 20x20 м, где уже были давно
-  const seen = new Map();
-  let repeated = 0, counted = 0;
-  pts.forEach((p, i) => {
-    const key = Math.round(p[0] * M_LAT / cell) + ':' + Math.round(p[1] * M_LON * cosLat / cell);
-    if (i >= edge && i < pts.length - edge) { // начало и конец пропускаем: там круг замыкается
-      counted++;
-      const j = seen.get(key);
-      if (j !== undefined && i - j > gap) repeated++;
-    }
-    if (!seen.has(key)) seen.set(key, i);
-  });
-  return counted ? repeated / counted : 0;
+// ---------- геометрия ----------
+
+function dist(a, b, cosLat) {
+  return Math.hypot((a[0] - b[0]) * M_LAT, (a[1] - b[1]) * M_LON * cosLat);
 }
 
-// пять точек на окружности, проходящей через текущее положение
-function loopPoints(angle, r) {
+// линия -> точки через каждые ~step метров (отрезок делится на равные части,
+// поэтому "туда" и "обратно" по одной улице дают совпадающие точки)
+function resample(line, step = 10) {
+  const cosLat = Math.cos(line[0][0] * Math.PI / 180);
+  const pts = [line[0]];
+  for (let i = 1; i < line.length; i++) {
+    const a = line[i - 1], b = line[i];
+    const d = dist(a, b, cosLat);
+    if (d < 0.5) continue;
+    const n = Math.max(1, Math.round(d / step));
+    for (let k = 1; k <= n; k++) {
+      pts.push([a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n]);
+    }
+  }
+  return pts;
+}
+
+function pathKm(pts) {
+  const cosLat = Math.cos(pts[0][0] * Math.PI / 180);
+  let m = 0;
+  for (let i = 1; i < pts.length; i++) m += dist(pts[i - 1], pts[i], cosLat);
+  return m / 1000;
+}
+
+// вырезает тупики: места, где путь доходит до конца и возвращается по тем же точкам
+// (a -> b -> тупик -> b -> a превращается в a). Возвращает число вырезанных тупиков.
+function removeSpurs(pts, tol = 4) {
+  const cosLat = Math.cos(pts[0][0] * Math.PI / 180);
+  let removed = 0, changed = true;
+  while (changed) {
+    changed = false;
+    for (let m = 1; m < pts.length - 1; m++) {
+      // m - точка разворота: соседи слева и справа лежат в одном и том же месте
+      if (dist(pts[m - 1], pts[m + 1], cosLat) > tol) continue;
+      let k = 1;
+      while (m - k - 1 >= 0 && m + k + 1 < pts.length &&
+             dist(pts[m - k - 1], pts[m + k + 1], cosLat) <= tol) k++;
+      pts.splice(m - k + 1, 2 * k); // pts[m-k] ≈ pts[m+k]: оставляем один из двойников
+      removed++;
+      changed = true;
+      break;
+    }
+  }
+  return removed;
+}
+
+// доля пути, который проходится повторно (0..1): точка близка к другой точке,
+// пройденной больше 200 м пути назад. Начало и конец круга не считаем.
+function overlapRatio(pts) {
+  const cell = 15, near = 12, gap = 20, edge = 20;
+  const cosLat = Math.cos(pts[0][0] * Math.PI / 180);
+  const grid = new Map();
+  let rep = 0, cnt = 0;
+  pts.forEach((p, i) => {
+    const cx = Math.floor(p[0] * M_LAT / cell), cy = Math.floor(p[1] * M_LON * cosLat / cell);
+    if (i >= edge && i < pts.length - edge) {
+      cnt++;
+      let hit = false;
+      for (let dx = -1; dx <= 1 && !hit; dx++) {
+        for (let dy = -1; dy <= 1 && !hit; dy++) {
+          const arr = grid.get((cx + dx) + ':' + (cy + dy));
+          if (!arr) continue;
+          for (const j of arr) {
+            if (i - j > gap && dist(p, pts[j], cosLat) < near) { hit = true; break; }
+          }
+        }
+      }
+      if (hit) rep++;
+    }
+    const key = cx + ':' + cy;
+    if (!grid.has(key)) grid.set(key, []);
+    grid.get(key).push(i);
+  });
+  return cnt ? rep / cnt : 0;
+}
+
+// очистка маршрута круга: тупики долой, длина и повторы считаются заново
+function processLoop(raw) {
+  const pts = resample(raw.line);
+  if (pts.length < 10) return null;
+  const spurs = removeSpurs(pts);
+  if (pts.length < 10) return null;
+  const km = pathKm(pts);
+  return { line: pts, km, min: km * 12, spurs, overlap: overlapRatio(pts) }; // 5 км/ч
+}
+
+// n точек на окружности, проходящей через текущее положение
+function loopPoints(angle, r, dir, n) {
   const kLat = 111.32, kLon = 111.32 * Math.cos(me[0] * Math.PI / 180);
   const center = [me[0] + (r / kLat) * Math.sin(angle), me[1] + (r / kLon) * Math.cos(angle)];
   const pts = [me];
-  const N = 5;
-  for (let i = 1; i < N; i++) {
-    const a = angle + Math.PI + (2 * Math.PI * i) / N;
+  for (let i = 1; i < n; i++) {
+    const a = angle + Math.PI + dir * (2 * Math.PI * i) / n;
     pts.push([center[0] + (r / kLat) * Math.sin(a), center[1] + (r / kLon) * Math.cos(a)]);
   }
   pts.push(me);
   return pts;
 }
 
-// круговой маршрут: несколько вариантов, подгонка длины, выбор лучшего
+// ---------- круговой маршрут ----------
+
 async function buildLoop() {
   if (!me) { status('Сначала определи своё положение.'); return; }
   const km = parseFloat($('km').value) || 3;
   const btn = $('build');
   btn.disabled = true;
 
+  const K = 5, MAX_ROUNDS = 4;
+  const OVERLAP_OK = 0.03, LEN_OK = 0.15;
+  let scale = 0.75;           // радиус круга относительно "идеального"; подстраивается сам
+  let best = null, tried = 0, lastErr = '';
+
   try {
-    const K = 4, ROUNDS = 2;
-    const base = Math.random() * 2 * Math.PI;
-    const cands = [];
-    for (let k = 0; k < K; k++) {
-      cands.push({ angle: base + (2 * Math.PI * k) / K, r: (km / (2 * Math.PI)) * 0.75 });
-    }
+    for (let round = 1; round <= MAX_ROUNDS; round++) {
+      status(`Ищу круг без повторов: попытка ${round} из ${MAX_ROUNDS}...`);
+      const base = Math.random() * 2 * Math.PI;
+      const r0 = (km / (2 * Math.PI)) * scale;
+      const cands = [];
+      for (let k = 0; k < K; k++) {
+        cands.push({ angle: base + (2 * Math.PI * k) / K, dir: k % 2 ? 1 : -1, n: 4 + (k % 3) });
+      }
 
-    let best = null;
-    for (let round = 1; round <= ROUNDS; round++) {
-      status(`Подбираю лучший круг: проход ${round} из ${ROUNDS}...`);
-      const res = await Promise.allSettled(cands.map(c => fetchRoute(loopPoints(c.angle, c.r))));
-      res.forEach((x, i) => {
-        if (x.status !== 'fulfilled') return;
-        const c = cands[i], r = x.value;
-        const overlap = overlapRatio(r.line);
-        const score = Math.abs(r.km - km) / km + 1.5 * overlap; // меньше = лучше
-        if (!best || score < best.score) best = { ...r, overlap, score };
-        // подгоняем радиус под нужную длину для следующего прохода
-        c.r *= Math.min(2, Math.max(0.5, km / r.km));
+      const res = await Promise.allSettled(
+        cands.map(c => fetchRoute(loopPoints(c.angle, r0, c.dir, c.n)))
+      );
+
+      const lens = [];
+      res.forEach(x => {
+        if (x.status !== 'fulfilled') { lastErr = x.reason && x.reason.message; return; }
+        const c = processLoop(x.value);
+        if (!c) return;
+        tried++;
+        lens.push(c.km);
+        c.lenErr = Math.abs(c.km - km) / km;
+        c.score = c.lenErr + 3 * c.overlap;   // повторы штрафуются сильнее, чем неточность длины
+        if (!best || c.score < best.score) best = c;
       });
+
+      // подгоняем радиус под нужную длину по медиане полученных длин
+      if (lens.length) {
+        lens.sort((a, b) => a - b);
+        const med = lens[Math.floor(lens.length / 2)];
+        scale *= Math.min(2, Math.max(0.5, km / med));
+      }
+
+      if (best && best.overlap <= OVERLAP_OK && best.lenErr <= LEN_OK) break; // нашли хороший
     }
 
-    if (!best) throw new Error('ни один вариант не построился');
+    if (!best) throw new Error(lastErr || 'ни один вариант не построился');
     drawRoute(best);
-    status(`Длина: ${best.km.toFixed(1)} км (цель ${km}), повторов пути: ${Math.round(best.overlap * 100)}%, ~${Math.round(best.min)} мин`);
+    const head = `Длина: ${best.km.toFixed(1)} км (цель ${km}), ~${Math.round(best.min)} мин`;
+    status(best.overlap <= OVERLAP_OK
+      ? head + ', без повторов'
+      : head + `, повторов ${Math.round(best.overlap * 100)}% (без повторов не нашлось, взял лучший из ${tried})`);
+    console.log('loop: вариантов', tried, 'тупиков вырезано', best.spurs, 'повторы', best.overlap);
   } catch (err) {
     status('Не удалось построить круг: ' + err.message);
     console.log('loop error:', err);
