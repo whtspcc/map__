@@ -42,105 +42,130 @@
 </div>
 
 <script>
-let map, me = null, meMark = null, route = null, mode = 'point';
-const $ = id => document.getElementById(id);
-const status = t => $('status').textContent = t;
+const M_LAT = 110540, M_LON = 111320; // метров в градусе
 
-ymaps.ready(() => {
-  map = new ymaps.Map('map', { center: [59.93, 30.31], zoom: 12, controls: ['zoomControl'] });
-
-  // режим "до точки": тап по карте
-  map.events.add('click', e => {
-    if (mode !== 'point') return;
-    if (!me) { status('Сначала определи своё положение.'); return; }
-    buildRoute([me, e.get('coords')]);
-  });
-});
-
-function locate() {
-  if (!navigator.geolocation) { status('Геолокация не поддерживается.'); return; }
-  status('Определяю положение...');
-  navigator.geolocation.getCurrentPosition(
-    pos => {
-      me = [pos.coords.latitude, pos.coords.longitude];
-      if (meMark) map.geoObjects.remove(meMark);
-      meMark = new ymaps.Placemark(me, {}, { preset: 'islands#blueCircleDotIcon' });
-      map.geoObjects.add(meMark);
-      map.setCenter(me, 15);
-      status(mode === 'point' ? 'Тапни по карте, куда идти.' : 'Задай длину и нажми «Построить».');
-    },
-    err => status('Ошибка геолокации: ' + err.message),
-    { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
-  );
-}
-
-async function buildRoute(points) {
-  if (route) map.geoObjects.remove(route);
-  route = null;
-  status('Строю маршрут...');
-
-  // у OSRM порядок координат lon,lat, у Яндекса lat,lon
+// запрос пешеходного маршрута; возвращает {line, km, min}
+async function fetchRoute(points) {
   const coords = points.map(p => p[1] + ',' + p[0]).join(';');
   const url = 'https://routing.openstreetmap.de/routed-foot/route/v1/foot/' +
               coords + '?overview=full&geometries=geojson';
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  const data = await resp.json();
+  if (data.code !== 'Ok' || !data.routes.length) throw new Error(data.code || 'нет маршрута');
+  const r = data.routes[0];
+  return {
+    line: r.geometry.coordinates.map(c => [c[1], c[0]]),
+    km: r.distance / 1000,
+    min: r.duration / 60
+  };
+}
 
+function drawRoute(r) {
+  if (route) map.geoObjects.remove(route);
+  route = new ymaps.Polyline(r.line, {}, {
+    strokeColor: '#2b7de9', strokeWidth: 5, strokeOpacity: 0.85
+  });
+  map.geoObjects.add(route);
+  map.setBounds(route.geometry.getBounds(), { checkZoomRange: true, zoomMargin: 40 });
+}
+
+// режим "до точки"
+async function buildRoute(points) {
+  status('Строю маршрут...');
   try {
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
-    const data = await resp.json();
-    if (data.code !== 'Ok' || !data.routes.length) throw new Error(data.code || 'нет маршрута');
-
-    const r = data.routes[0];
-    const line = r.geometry.coordinates.map(c => [c[1], c[0]]); // обратно в lat,lon
-
-    route = new ymaps.Polyline(line, {}, {
-      strokeColor: '#2b7de9',
-      strokeWidth: 5,
-      strokeOpacity: 0.85
-    });
-    map.geoObjects.add(route);
-    map.setBounds(route.geometry.getBounds(), { checkZoomRange: true, zoomMargin: 40 });
-
-    const km = (r.distance / 1000).toFixed(1);
-    const min = Math.round(r.duration / 60);
-    status(`Длина: ${km} км, время пешком: ~${min} мин`);
+    const r = await fetchRoute(points);
+    drawRoute(r);
+    status(`Длина: ${r.km.toFixed(1)} км, время пешком: ~${Math.round(r.min)} мин`);
   } catch (err) {
     status('Не удалось построить маршрут: ' + err.message);
     console.log('route error:', err);
   }
 }
 
-// круговой маршрут: точки на окружности, проходящей через текущее положение
-function buildLoop() {
-  if (!me) { status('Сначала определи своё положение.'); return; }
-  const km = parseFloat($('km').value) || 3;
-  // по улицам путь длиннее прямой окружности, поэтому берём запас
-  const r = (km / (2 * Math.PI)) * 0.75;
-  const startAngle = Math.random() * 2 * Math.PI;
+// доля маршрута, где ты идёшь по тем же местам повторно (0..1)
+function overlapRatio(line) {
+  const step = 10, cell = 20, edge = 15, gap = 30;
+  const cosLat = Math.cos(line[0][0] * Math.PI / 180);
+  // 1) разбиваем линию на точки через каждые ~10 м
+  const pts = [line[0]];
+  for (let i = 1; i < line.length; i++) {
+    const [la1, lo1] = line[i - 1], [la2, lo2] = line[i];
+    const dist = Math.hypot((la2 - la1) * M_LAT, (lo2 - lo1) * M_LON * cosLat);
+    const n = Math.max(1, Math.round(dist / step));
+    for (let k = 1; k <= n; k++) {
+      pts.push([la1 + (la2 - la1) * k / n, lo1 + (lo2 - lo1) * k / n]);
+    }
+  }
+  // 2) считаем точки, попавшие в клетку 20x20 м, где уже были давно
+  const seen = new Map();
+  let repeated = 0, counted = 0;
+  pts.forEach((p, i) => {
+    const key = Math.round(p[0] * M_LAT / cell) + ':' + Math.round(p[1] * M_LON * cosLat / cell);
+    if (i >= edge && i < pts.length - edge) { // начало и конец пропускаем: там круг замыкается
+      counted++;
+      const j = seen.get(key);
+      if (j !== undefined && i - j > gap) repeated++;
+    }
+    if (!seen.has(key)) seen.set(key, i);
+  });
+  return counted ? repeated / counted : 0;
+}
+
+// пять точек на окружности, проходящей через текущее положение
+function loopPoints(angle, r) {
   const kLat = 111.32, kLon = 111.32 * Math.cos(me[0] * Math.PI / 180);
-  const center = [me[0] + (r / kLat) * Math.sin(startAngle), me[1] + (r / kLon) * Math.cos(startAngle)];
+  const center = [me[0] + (r / kLat) * Math.sin(angle), me[1] + (r / kLon) * Math.cos(angle)];
   const pts = [me];
   const N = 5;
   for (let i = 1; i < N; i++) {
-    const a = startAngle + Math.PI + (2 * Math.PI * i) / N; // движемся по кругу от старта
+    const a = angle + Math.PI + (2 * Math.PI * i) / N;
     pts.push([center[0] + (r / kLat) * Math.sin(a), center[1] + (r / kLon) * Math.cos(a)]);
   }
   pts.push(me);
-  buildRoute(pts);
+  return pts;
 }
 
-function setMode(m) {
-  mode = m;
-  $('modePoint').classList.toggle('active', m === 'point');
-  $('modeLoop').classList.toggle('active', m === 'loop');
-  $('loopRow').style.display = m === 'loop' ? 'flex' : 'none';
-  status(m === 'point' ? 'Тапни по карте, куда идти.' : 'Задай длину и нажми «Построить».');
-}
+// круговой маршрут: несколько вариантов, подгонка длины, выбор лучшего
+async function buildLoop() {
+  if (!me) { status('Сначала определи своё положение.'); return; }
+  const km = parseFloat($('km').value) || 3;
+  const btn = $('build');
+  btn.disabled = true;
 
-$('locate').onclick = locate;
-$('modePoint').onclick = () => setMode('point');
-$('modeLoop').onclick = () => setMode('loop');
-$('build').onclick = buildLoop;
+  try {
+    const K = 4, ROUNDS = 2;
+    const base = Math.random() * 2 * Math.PI;
+    const cands = [];
+    for (let k = 0; k < K; k++) {
+      cands.push({ angle: base + (2 * Math.PI * k) / K, r: (km / (2 * Math.PI)) * 0.75 });
+    }
+
+    let best = null;
+    for (let round = 1; round <= ROUNDS; round++) {
+      status(`Подбираю лучший круг: проход ${round} из ${ROUNDS}...`);
+      const res = await Promise.allSettled(cands.map(c => fetchRoute(loopPoints(c.angle, c.r))));
+      res.forEach((x, i) => {
+        if (x.status !== 'fulfilled') return;
+        const c = cands[i], r = x.value;
+        const overlap = overlapRatio(r.line);
+        const score = Math.abs(r.km - km) / km + 1.5 * overlap; // меньше = лучше
+        if (!best || score < best.score) best = { ...r, overlap, score };
+        // подгоняем радиус под нужную длину для следующего прохода
+        c.r *= Math.min(2, Math.max(0.5, km / r.km));
+      });
+    }
+
+    if (!best) throw new Error('ни один вариант не построился');
+    drawRoute(best);
+    status(`Длина: ${best.km.toFixed(1)} км (цель ${km}), повторов пути: ${Math.round(best.overlap * 100)}%, ~${Math.round(best.min)} мин`);
+  } catch (err) {
+    status('Не удалось построить круг: ' + err.message);
+    console.log('loop error:', err);
+  } finally {
+    btn.disabled = false;
+  }
+}
 </script>
 </body>
 </html>
